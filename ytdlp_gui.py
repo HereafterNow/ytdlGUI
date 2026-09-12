@@ -1,403 +1,409 @@
-"""
-yt-dlp GUI — a simple Windows 11-styled desktop wrapper around yt-dlp.
-
-Features:
-  - URL input
-  - Download location picker
-  - Resolution selector
-  - Video / Video-only / Audio-only mode (radio buttons)
-  - Live progress bar + log
-
-Requirements (install once):
-    pip install -r requirements.txt
-
-ffmpeg is required to merge separate video+audio streams and to extract
-audio to mp3. If ffmpeg isn't on your PATH, this app will fall back to
-the bundled binary from the optional `imageio-ffmpeg` package.
-"""
-
-import os
-import sys
-import shutil
+import tkinter as tk
+from tkinter import ttk, filedialog
 import subprocess
 import threading
+import shutil
 import queue
-from pathlib import Path
+import re
+import os
+import json
 
-# When frozen into a PyInstaller --onefile exe, customtkinter's theme/font
-# assets are unpacked into a temp folder (sys._MEIPASS) at startup, and some
-# versions of customtkinter resolve those assets relative to the current
-# working directory. Switching into that folder before importing it avoids
-# a FileNotFoundError for the theme .json file. This block is a no-op when
-# running as a plain .py script (sys.frozen is only set inside a build).
-if getattr(sys, "frozen", False):
-    os.chdir(sys._MEIPASS)
+RESOLUTIONS = [
+    ("Max", None),
+    ("2160p (4K)", 2160),
+    ("1440p (2K)", 1440),
+    ("1080p", 1080),
+    ("720p", 720),
+    ("480p", 480),
+    ("360p", 360),
+    ("240p", 240),
+    ("144p", 144),
+]
 
-import customtkinter as ctk
-from tkinter import filedialog, messagebox
+PROGRESS_RE = re.compile(r"\[download\]\s+(\d+\.?\d*)%")
 
-try:
-    import yt_dlp
-except ImportError:
-    yt_dlp = None
+# Config location: C:\Users\Trung\AppData\Roaming\ytdlp_gui.json
+CONFIG_PATH = os.path.join(
+    os.environ.get("APPDATA", r"C:\Users\Trung\AppData\Roaming"),
+    "ytdlp_gui.json",
+)
 
-
-def find_ffmpeg():
-    """Look for ffmpeg on PATH, then fall back to imageio-ffmpeg's bundled binary."""
-    ffmpeg = shutil.which("ffmpeg")
-    if ffmpeg:
-        return ffmpeg
+def load_config():
     try:
-        import imageio_ffmpeg
-        return imageio_ffmpeg.get_ffmpeg_exe()
-    except ImportError:
-        return None
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
 
+def save_config(data):
+    try:
+        os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except OSError:
+        pass
 
-RESOLUTIONS = {
-    "Best available": None,
-    "2160p (4K)": 2160,
-    "1440p (2K)": 1440,
-    "1080p (Full HD)": 1080,
-    "720p (HD)": 720,
-    "480p": 480,
-    "360p": 360,
-}
+def build_format(height, video_only):
+    if video_only:
+        if height is None:
+            return "bv*/b"
+        return f"bv*[height<={height}]/b[height<={height}]/b"
+    if height is None:
+        return "bv*+ba/b"
+    return f"bv*[height<={height}]+ba/b[height<={height}]/b"
 
+def resolve_ytdlp(folder):
+    """Return the yt-dlp executable to use, or None."""
+    if folder:
+        folder = folder.strip().strip('"')
+        for name in ("yt-dlp.exe", "yt-dlp"):
+            candidate = os.path.join(folder, name)
+            if os.path.isfile(candidate):
+                return candidate
+    return shutil.which("yt-dlp")
 
-class YTDLApp(ctk.CTk):
-    def __init__(self):
-        super().__init__()
-        self.title("yt-dlp GUI")
-        self.geometry("640x620")
-        self.minsize(600, 580)
+class DownloaderApp:
+    def __init__(self, root):
+        self.root = root
+        root.title("yt-dlp GUI")
+        root.geometry("860x780")
 
-        ctk.set_appearance_mode("System")   # follows Windows 11 light/dark mode
-        ctk.set_default_color_theme("blue")
+        self.job_queue = queue.Queue()
+        self.worker_thread = None
+        self.current_proc = None
+        self.cancel_flag = threading.Event()
+        self.update_running = False
 
-        self.ffmpeg_path = find_ffmpeg()
-        self.download_thread = None
-        self.update_thread = None
-        self.ui_queue = queue.Queue()
-
+        self.config = load_config()
         self._build_ui()
-        self.after(100, self._poll_ui_queue)
+        root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-    # ---------------------------------------------------------------- UI --
+    # ---------- UI ----------
     def _build_ui(self):
-        pad = {"padx": 16, "pady": 8}
+        root = self.root
 
-        ctk.CTkLabel(
-            self, text="yt-dlp Downloader", font=ctk.CTkFont(size=20, weight="bold")
-        ).pack(anchor="w", padx=16, pady=(16, 0))
-
-        # --- URL -----------------------------------------------------
-        url_frame = ctk.CTkFrame(self, fg_color="transparent")
-        url_frame.pack(fill="x", **pad)
-        ctk.CTkLabel(url_frame, text="Video URL", anchor="w").pack(fill="x")
-        self.url_entry = ctk.CTkEntry(
-            url_frame, placeholder_text="https://www.youtube.com/watch?v=..."
+        # yt-dlp folder (top)
+        ytdlp_frame = tk.Frame(root)
+        ytdlp_frame.pack(fill="x", padx=8, pady=(8, 0))
+        tk.Label(ytdlp_frame, text="yt-dlp folder:").pack(side="left")
+        self.ytdlp_folder_var = tk.StringVar(value=self.config.get("ytdlp_folder", ""))
+        self.ytdlp_folder_var.trace_add("write", lambda *_: self._save_now())
+        tk.Entry(ytdlp_frame, textvariable=self.ytdlp_folder_var).pack(
+            side="left", fill="x", expand=True, padx=4
         )
-        self.url_entry.pack(fill="x", pady=(4, 0))
-
-        # --- Download location ---------------------------------------
-        loc_frame = ctk.CTkFrame(self, fg_color="transparent")
-        loc_frame.pack(fill="x", **pad)
-        ctk.CTkLabel(loc_frame, text="Download location", anchor="w").pack(fill="x")
-        loc_row = ctk.CTkFrame(loc_frame, fg_color="transparent")
-        loc_row.pack(fill="x", pady=(4, 0))
-        self.location_var = ctk.StringVar(value=str(Path.home() / "Downloads"))
-        self.location_entry = ctk.CTkEntry(loc_row, textvariable=self.location_var)
-        self.location_entry.pack(side="left", fill="x", expand=True)
-        ctk.CTkButton(loc_row, text="Browse...", width=90, command=self._browse).pack(
-            side="left", padx=(8, 0)
+        tk.Button(
+            ytdlp_frame, text="Folder…",
+            command=lambda: self.ytdlp_folder_var.set(
+                filedialog.askdirectory() or self.ytdlp_folder_var.get()
+            ),
+        ).pack(side="left")
+        tk.Label(ytdlp_frame, text="(blank = use PATH)", fg="gray").pack(
+            side="left", padx=(6, 0)
         )
 
-        # --- Resolution + mode ----------------------------------------
-        opts_frame = ctk.CTkFrame(self, fg_color="transparent")
-        opts_frame.pack(fill="x", **pad)
+        # URL + Add to queue
+        url_frame = tk.Frame(root)
+        url_frame.pack(fill="x", padx=8, pady=(4, 0))
+        tk.Label(url_frame, text="URL:").pack(side="left")
+        self.url_entry = tk.Entry(url_frame)
+        self.url_entry.pack(side="left", fill="x", expand=True, padx=4)
+        self.url_entry.bind("<Return>", lambda e: self.add_to_queue())
+        self.add_btn = tk.Button(url_frame, text="Add to queue", command=self.add_to_queue)
+        self.add_btn.pack(side="left")
 
-        res_col = ctk.CTkFrame(opts_frame, fg_color="transparent")
-        res_col.pack(side="left", fill="both", expand=True)
-        ctk.CTkLabel(res_col, text="Resolution", anchor="w").pack(fill="x")
-        self.resolution_var = ctk.StringVar(value="1080p (Full HD)")
-        ctk.CTkOptionMenu(
-            res_col, values=list(RESOLUTIONS.keys()), variable=self.resolution_var
-        ).pack(fill="x", pady=(4, 0))
-
-        mode_col = ctk.CTkFrame(opts_frame, fg_color="transparent")
-        mode_col.pack(side="left", fill="both", expand=True, padx=(16, 0))
-        ctk.CTkLabel(mode_col, text="Download as", anchor="w").pack(fill="x")
-        self.mode_var = ctk.StringVar(value="video")
-        ctk.CTkRadioButton(
-            mode_col, text="Video (with audio)", variable=self.mode_var, value="video"
-        ).pack(anchor="w", pady=(4, 0))
-        ctk.CTkRadioButton(
-            mode_col,
-            text="Video only (no audio)",
-            variable=self.mode_var,
-            value="video_only",
-        ).pack(anchor="w", pady=(4, 0))
-        ctk.CTkRadioButton(
-            mode_col, text="Audio only (MP3)", variable=self.mode_var, value="audio"
-        ).pack(anchor="w", pady=(4, 0))
-
-        # --- Progress ---------------------------------------------------
-        prog_frame = ctk.CTkFrame(self, fg_color="transparent")
-        prog_frame.pack(fill="x", **pad)
-        self.progress_bar = ctk.CTkProgressBar(prog_frame)
-        self.progress_bar.set(0)
-        self.progress_bar.pack(fill="x")
-        self.status_label = ctk.CTkLabel(prog_frame, text="Idle", anchor="w")
-        self.status_label.pack(fill="x", pady=(4, 0))
-
-        # --- Log ----------------------------------------------------------
-        log_frame = ctk.CTkFrame(self, fg_color="transparent")
-        log_frame.pack(fill="both", expand=True, **pad)
-        ctk.CTkLabel(log_frame, text="Log", anchor="w").pack(fill="x")
-        self.log_box = ctk.CTkTextbox(log_frame, height=140)
-        self.log_box.pack(fill="both", expand=True, pady=(4, 0))
-        self.log_box.configure(state="disabled")
-
-        # --- Download button -----------------------------------------
-        btn_frame = ctk.CTkFrame(self, fg_color="transparent")
-        btn_frame.pack(fill="x", **pad)
-        self.download_btn = ctk.CTkButton(
-            btn_frame, text="Download", height=36, command=self._start_download
+        # Output folder
+        folder_frame = tk.Frame(root)
+        folder_frame.pack(fill="x", padx=8, pady=4)
+        tk.Label(folder_frame, text="Save to:").pack(side="left")
+        self.folder_var = tk.StringVar(value=self.config.get("save_folder", ""))
+        self.folder_var.trace_add("write", lambda *_: self._save_now())
+        tk.Entry(folder_frame, textvariable=self.folder_var).pack(
+            side="left", fill="x", expand=True, padx=4
         )
-        self.download_btn.pack(fill="x")
+        tk.Button(
+            folder_frame, text="Folder…",
+            command=lambda: self.folder_var.set(
+                filedialog.askdirectory() or self.folder_var.get()
+            ),
+        ).pack(side="left")
 
-        # --- yt-dlp version / update -----------------------------------
-        version_frame = ctk.CTkFrame(self, fg_color="transparent")
-        version_frame.pack(fill="x", padx=16, pady=(0, 12))
-        self.version_label = ctk.CTkLabel(
-            version_frame,
-            text=self._current_ytdlp_version(),
-            text_color=("gray40", "gray60"),
+        # Options
+        opts = tk.Frame(root)
+        opts.pack(fill="x", padx=8, pady=4)
+
+        tk.Label(opts, text="Max resolution:").pack(side="left")
+        self.res_combo = ttk.Combobox(
+            opts, values=[l for l, _ in RESOLUTIONS], state="readonly", width=14
         )
-        self.version_label.pack(side="left")
-        self.update_btn = ctk.CTkButton(
-            version_frame,
-            text="Check for yt-dlp update",
-            width=180,
-            height=26,
-            fg_color="transparent",
-            border_width=1,
-            command=self._start_update,
+        self.res_combo.current(0)
+        self.res_combo.pack(side="left", padx=(4, 16))
+
+        self.merge_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(opts, text="Merge to MP4", variable=self.merge_var).pack(
+            side="left", padx=(0, 12)
         )
-        self.update_btn.pack(side="right")
 
-        if yt_dlp is None:
-            self._log("yt-dlp is not installed. Run: pip install -r requirements.txt")
-        if self.ffmpeg_path is None:
-            self._log("Warning: ffmpeg not found. Merging video+audio and MP3 extraction need it.")
-            self._log("Install with: winget install ffmpeg   (or) pip install imageio-ffmpeg")
+        self.audio_only_var = tk.BooleanVar(value=False)
+        self.video_only_var = tk.BooleanVar(value=False)
+        self.audio_only_var.trace_add("write", self._update_format_state)
+        self.video_only_var.trace_add("write", self._update_format_state)
 
-    # ------------------------------------------------------------ helpers --
-    def _current_ytdlp_version(self):
-        if yt_dlp is None:
-            return "yt-dlp: not installed"
-        try:
-            return f"yt-dlp v{yt_dlp.version.__version__}"
-        except Exception:
-            return "yt-dlp: version unknown"
-
-    def _browse(self):
-        chosen = filedialog.askdirectory(
-            initialdir=self.location_var.get() or str(Path.home())
+        tk.Checkbutton(opts, text="Audio only (MP3)", variable=self.audio_only_var).pack(
+            side="left", padx=(0, 12)
         )
-        if chosen:
-            self.location_var.set(chosen)
+        tk.Checkbutton(opts, text="Video only (no audio)", variable=self.video_only_var).pack(
+            side="left"
+        )
 
-    def _log(self, msg):
-        self.log_box.configure(state="normal")
-        self.log_box.insert("end", msg + "\n")
-        self.log_box.see("end")
-        self.log_box.configure(state="disabled")
+        # Queue list + buttons
+        q_frame = tk.LabelFrame(root, text="Queue")
+        q_frame.pack(fill="both", expand=False, padx=8, pady=4)
 
-    def _poll_ui_queue(self):
-        """Runs on the main thread only — safe place to touch widgets."""
-        try:
-            while True:
-                kind, payload = self.ui_queue.get_nowait()
-                if kind == "log":
-                    self._log(payload)
-                elif kind == "progress":
-                    frac, status = payload
-                    self.progress_bar.set(max(0.0, min(1.0, frac)))
-                    if status:
-                        self.status_label.configure(text=status)
-                elif kind == "done":
-                    self.download_btn.configure(state="normal", text="Download")
-                    messagebox.showinfo("Done", "Download completed successfully.")
-                elif kind == "error":
-                    self.download_btn.configure(state="normal", text="Download")
-                    messagebox.showerror("Download failed", payload)
-                elif kind == "update_done":
-                    self.update_btn.configure(state="normal", text="Check for yt-dlp update")
-                    self.version_label.configure(text=self._current_ytdlp_version())
-                    messagebox.showinfo(
-                        "Update finished",
-                        "pip has finished updating yt-dlp.\n"
-                        "Restart this app for the new version to take effect "
-                        "(the copy already running stays loaded in memory until then).",
-                    )
-                elif kind == "update_error":
-                    self.update_btn.configure(state="normal", text="Check for yt-dlp update")
-                    messagebox.showerror("Update failed", payload)
-        except queue.Empty:
-            pass
-        self.after(150, self._poll_ui_queue)
+        self.queue_list = tk.Listbox(q_frame, height=6)
+        self.queue_list.pack(side="left", fill="both", expand=True, padx=(4, 0), pady=4)
+        sb = tk.Scrollbar(q_frame, orient="vertical", command=self.queue_list.yview)
+        sb.pack(side="left", fill="y", pady=4)
+        self.queue_list.config(yscrollcommand=sb.set)
 
-    # ------------------------------------------------------- download logic --
-    def _start_download(self):
-        if yt_dlp is None:
-            messagebox.showerror(
-                "Missing dependency", "yt-dlp is not installed.\nRun: pip install yt-dlp"
-            )
-            return
-        if self.download_thread and self.download_thread.is_alive():
-            messagebox.showinfo("Busy", "A download is already in progress.")
-            return
-        if self.update_thread and self.update_thread.is_alive():
-            messagebox.showinfo("Busy", "Wait for the yt-dlp update to finish first.")
-            return
+        q_btns = tk.Frame(q_frame)
+        q_btns.pack(side="left", fill="y", padx=4, pady=4)
 
+        self.remove_btn = tk.Button(q_btns, text="Remove", command=self.remove_selected)
+        self.remove_btn.pack(fill="x", pady=2)
+        self.clear_btn = tk.Button(q_btns, text="Clear", command=self.clear_queue)
+        self.clear_btn.pack(fill="x", pady=2)
+        self.start_btn = tk.Button(q_btns, text="Start", command=self.start_queue)
+        self.start_btn.pack(fill="x", pady=2)
+        self.cancel_btn = tk.Button(q_btns, text="Cancel", command=self.cancel_current)
+        self.cancel_btn.pack(fill="x", pady=2)
+
+        tk.Frame(q_btns, height=8).pack(fill="x")
+        self.update_btn = tk.Button(q_btns, text="Update yt-dlp (-U)", command=self.update_ytdlp)
+        self.update_btn.pack(fill="x", pady=2)
+
+        # Progress bar
+        prog_frame = tk.Frame(root)
+        prog_frame.pack(fill="x", padx=8, pady=(0, 4))
+        self.progress = ttk.Progressbar(prog_frame, mode="determinate", maximum=100)
+        self.progress.pack(side="left", fill="x", expand=True)
+        self.progress_label = tk.Label(prog_frame, text="idle", width=12, anchor="e")
+        self.progress_label.pack(side="left", padx=(8, 0))
+
+        # Log
+        self.log = tk.Text(root, wrap="word", height=16)
+        self.log.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+
+        self._update_format_state()
+
+    def _update_format_state(self, *_):
+        if self.audio_only_var.get():
+            self.res_combo.config(state="disabled")
+        else:
+            self.res_combo.config(state="readonly")
+
+        if self.audio_only_var.get() and self.video_only_var.get():
+            self.video_only_var.set(False)
+
+    # ---------- Config ----------
+    def _save_now(self):
+        save_config({
+            "ytdlp_folder": self.ytdlp_folder_var.get().strip(),
+            "save_folder": self.folder_var.get().strip(),
+        })
+
+    # ---------- Enable/disable groups ----------
+    def _set_download_controls_enabled(self, enabled):
+        state = "normal" if enabled else "disabled"
+        for w in (self.add_btn, self.remove_btn, self.clear_btn,
+                  self.start_btn, self.cancel_btn):
+            w.config(state=state)
+
+    def _set_update_enabled(self, enabled):
+        self.update_btn.config(state="normal" if enabled else "disabled")
+
+    # ---------- yt-dlp resolution ----------
+    def _ytdlp_path(self):
+        return resolve_ytdlp(self.ytdlp_folder_var.get()) or "yt-dlp"
+
+    def _check_ytdlp(self):
+        folder = self.ytdlp_folder_var.get().strip()
+        path = resolve_ytdlp(folder)
+        if path is None:
+            if folder:
+                self._log(
+                    f"[warn] No yt-dlp.exe or yt-dlp found in:\n"
+                    f"       {folder}\n"
+                    f"       Falling back to 'yt-dlp' on PATH.\n\n"
+                )
+            else:
+                self._log(
+                    "[warn] yt-dlp not found on PATH. Set a yt-dlp folder above.\n\n"
+                )
+            return False
+        return True
+
+    # ---------- Queue management ----------
+    def add_to_queue(self):
         url = self.url_entry.get().strip()
         if not url:
-            messagebox.showwarning("Missing URL", "Paste a video URL first.")
+            return
+        self.queue_list.insert(tk.END, url)
+        self.url_entry.delete(0, tk.END)
+
+    def remove_selected(self):
+        for i in reversed(self.queue_list.curselection()):
+            self.queue_list.delete(i)
+
+    def clear_queue(self):
+        self.queue_list.delete(0, tk.END)
+
+    def start_queue(self):
+        if self.worker_thread and self.worker_thread.is_alive():
+            self._log("Queue already running.\n")
+            return
+        items = list(self.queue_list.get(0, tk.END))
+        if not items:
+            self._log("Queue is empty.\n")
             return
 
-        out_dir = self.location_var.get().strip() or str(Path.home() / "Downloads")
-        Path(out_dir).mkdir(parents=True, exist_ok=True)
+        self._check_ytdlp()
 
-        mode = self.mode_var.get()
-        if mode == "audio" and self.ffmpeg_path is None:
-            messagebox.showwarning(
-                "ffmpeg required",
-                "Audio extraction needs ffmpeg.\n"
-                "Install it (winget install ffmpeg) or run: pip install imageio-ffmpeg",
-            )
-            return
+        self.clear_queue()
+        for url in items:
+            self.job_queue.put(url)
+        self.cancel_flag.clear()
 
-        height = RESOLUTIONS[self.resolution_var.get()]
-        self.download_btn.configure(state="disabled", text="Downloading...")
-        self.progress_bar.set(0)
-        self.status_label.configure(text="Starting...")
+        self._set_update_enabled(False)
 
-        self.download_thread = threading.Thread(
-            target=self._run_download, args=(url, out_dir, mode, height), daemon=True
-        )
-        self.download_thread.start()
+        self.worker_thread = threading.Thread(target=self._worker, daemon=True)
+        self.worker_thread.start()
 
-    def _run_download(self, url, out_dir, mode, height):
-        """Runs in a background thread. Only ever pushes to ui_queue —
-        never touches Tkinter widgets directly (Tkinter is not thread-safe)."""
+    def cancel_current(self):
+        self.cancel_flag.set()
+        if self.current_proc and self.current_proc.poll() is None:
+            self.current_proc.terminate()
+            self._log("\n[cancel] terminating current download…\n")
+
+    # ---------- Worker ----------
+    def _worker(self):
+        while not self.cancel_flag.is_set():
+            try:
+                url = self.job_queue.get_nowait()
+            except queue.Empty:
+                break
+            self._run_one(url)
+        self.root.after(0, lambda: self._set_progress(0, "idle"))
+        self._log("\n[queue] done.\n")
+        self.root.after(0, lambda: self._set_update_enabled(True))
+
+    def _run_one(self, url):
+        ytdlp = self._ytdlp_path()
+        out_dir = self.folder_var.get().strip() or "."
+        outtmpl = os.path.join(out_dir, "%(title)s.%(ext)s")
+
+        label, height = RESOLUTIONS[self.res_combo.current()]
+        audio_only = self.audio_only_var.get()
+        video_only = self.video_only_var.get()
+
+        if audio_only:
+            cmd = [ytdlp, "-x", "--audio-format", "mp3", "-o", outtmpl]
+        else:
+            fmt = build_format(height, video_only)
+            cmd = [ytdlp, "-f", fmt, "-o", outtmpl]
+            if self.merge_var.get() and not video_only:
+                cmd += ["--merge-output-format", "mp4"]
+
+        cmd += ["--newline", url]
+
+        self._log(f"\n$ {' '.join(cmd)}\n\n")
+        self.root.after(0, lambda: self._set_progress(0, "0%"))
+
         try:
-            ydl_opts = {
-                "outtmpl": os.path.join(out_dir, "%(title)s.%(ext)s"),
-                "progress_hooks": [self._progress_hook],
-                "noplaylist": True,
-                "quiet": True,
-                "no_warnings": True,
-            }
-            if self.ffmpeg_path:
-                ydl_opts["ffmpeg_location"] = self.ffmpeg_path
-
-            height_filter = f"[height<={height}]" if height else ""
-
-            if mode == "video":
-                ydl_opts["format"] = f"bestvideo{height_filter}+bestaudio/best{height_filter}"
-                ydl_opts["merge_output_format"] = "mp4"
-            elif mode == "video_only":
-                ydl_opts["format"] = f"bestvideo{height_filter}"
-            elif mode == "audio":
-                ydl_opts["format"] = "bestaudio/best"
-                ydl_opts["postprocessors"] = [
-                    {
-                        "key": "FFmpegExtractAudio",
-                        "preferredcodec": "mp3",
-                        "preferredquality": "192",
-                    }
-                ]
-
-            self.ui_queue.put(("log", f"Downloading: {url}"))
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([url])
-
-            self.ui_queue.put(("log", "Done."))
-            self.ui_queue.put(("progress", (1.0, "Completed")))
-            self.ui_queue.put(("done", None))
-        except Exception as e:
-            self.ui_queue.put(("log", f"Error: {e}"))
-            self.ui_queue.put(("progress", (0, "Failed")))
-            self.ui_queue.put(("error", str(e)))
-
-    def _progress_hook(self, d):
-        """Called by yt-dlp from the background thread — must only queue, not draw."""
-        status = d.get("status")
-        if status == "downloading":
-            total = d.get("total_bytes") or d.get("total_bytes_estimate")
-            downloaded = d.get("downloaded_bytes", 0)
-            frac = downloaded / total if total else 0
-            pct = f"{frac * 100:.1f}%" if total else "..."
-            speed = d.get("speed")
-            speed_str = f"{speed / 1024 / 1024:.2f} MB/s" if speed else "-"
-            self.ui_queue.put(("progress", (frac, f"Downloading {pct} @ {speed_str}")))
-        elif status == "finished":
-            self.ui_queue.put(("progress", (1.0, "Processing (merging/converting)...")))
-            self.ui_queue.put(("log", "Download finished, post-processing..."))
-
-    # --------------------------------------------------------- update logic --
-    def _start_update(self):
-        """Runs only when the button is clicked — nothing here updates automatically."""
-        if getattr(sys, "frozen", False):
-            messagebox.showinfo(
-                "Not available in this build",
-                "This packaged .exe doesn't carry pip or a live Python install "
-                "with it, so it can't update yt-dlp in place.\n\n"
-                "To get a newer yt-dlp: run ytdlp_gui.py directly with Python "
-                "installed (where this button works normally), or rebuild the "
-                ".exe after running 'pip install --upgrade yt-dlp' yourself.",
-            )
-            return
-        if self.download_thread and self.download_thread.is_alive():
-            messagebox.showinfo("Busy", "Wait for the current download to finish first.")
-            return
-        if self.update_thread and self.update_thread.is_alive():
-            return
-
-        self.update_btn.configure(state="disabled", text="Updating...")
-        self._log("Checking for a newer yt-dlp release...")
-
-        self.update_thread = threading.Thread(target=self._run_update, daemon=True)
-        self.update_thread.start()
-
-    def _run_update(self):
-        """Runs in a background thread. Only ever pushes to ui_queue (see _run_download)."""
-        try:
-            cmd = [sys.executable, "-m", "pip", "install", "--upgrade", "yt-dlp"]
-            proc = subprocess.Popen(
+            self.current_proc = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
                 bufsize=1,
             )
-            for line in proc.stdout:
-                line = line.rstrip()
-                if line:
-                    self.ui_queue.put(("log", line))
-            proc.wait()
+        except FileNotFoundError:
+            self._log(f"[error] yt-dlp not found: {ytdlp}\n")
+            return
 
-            if proc.returncode == 0:
-                self.ui_queue.put(("update_done", None))
-            else:
-                self.ui_queue.put(("update_error", f"pip exited with code {proc.returncode}"))
-        except Exception as e:
-            self.ui_queue.put(("update_error", str(e)))
+        assert self.current_proc.stdout is not None
+        for line in self.current_proc.stdout:
+            self._log(line)
+            m = PROGRESS_RE.search(line)
+            if m:
+                pct = float(m.group(1))
+                self.root.after(0, lambda p=pct: self._set_progress(p, f"{p:.0f}%"))
 
+        self.current_proc.wait()
+        code = self.current_proc.returncode
+        self._log(f"\n[done] exit code {code}\n")
+        self.current_proc = None
+
+    # ---------- Update ----------
+    def update_ytdlp(self):
+        if self.update_running:
+            return
+        if self.worker_thread and self.worker_thread.is_alive():
+            self._log("[update] downloads are running; cancel them first.\n")
+            return
+
+        if not self._check_ytdlp():
+            self._log("[update] aborting — set a valid yt-dlp folder or fix PATH.\n")
+            return
+
+        ytdlp = self._ytdlp_path()
+        cmd = [ytdlp, "-U"]
+
+        self._log(f"\n$ {' '.join(cmd)}\n\n")
+        self.update_running = True
+
+        self._set_download_controls_enabled(False)
+        self._set_update_enabled(False)
+
+        def worker():
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                )
+                for line in proc.stdout:
+                    self._log(line)
+                proc.wait()
+                self._log(f"\n[update] exit code {proc.returncode}\n")
+            except FileNotFoundError:
+                self._log(f"[error] command not found: {cmd[0]}\n")
+            finally:
+                self.update_running = False
+                self.root.after(0, lambda: self._set_download_controls_enabled(True))
+                self.root.after(0, lambda: self._set_update_enabled(True))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    # ---------- Thread-safe UI helpers ----------
+    def _log(self, text):
+        self.root.after(0, lambda: self._append_log(text))
+
+    def _append_log(self, text):
+        self.log.insert(tk.END, text)
+        self.log.see(tk.END)
+
+    def _set_progress(self, pct, label):
+        self.progress["value"] = pct
+        self.progress_label.config(text=label)
+
+    # ---------- Lifecycle ----------
+    def _on_close(self):
+        self._save_now()
+        self.root.destroy()
 
 if __name__ == "__main__":
-    app = YTDLApp()
-    app.mainloop()
+    root = tk.Tk()
+    app = DownloaderApp(root)
+    root.mainloop()
