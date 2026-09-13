@@ -52,6 +52,31 @@ def build_format(height, video_only):
         return "bv*+ba/b"
     return f"bv*[height<={height}]+ba/b[height<={height}]/b"
 
+def split_extra_args(expr):
+    """Split a command line on whitespace, honoring quotes.
+
+    Unlike shlex.split, backslashes are kept literal so Windows paths
+    like "Z:\\My Folder" survive intact.
+    """
+    args, buf, quote = [], [], None
+    for ch in expr:
+        if quote:
+            if ch == quote:
+                quote = None
+            else:
+                buf.append(ch)
+        elif ch in ('"', "'"):
+            quote = ch
+        elif ch.isspace():
+            if buf:
+                args.append("".join(buf))
+                buf = []
+        else:
+            buf.append(ch)
+    if buf:
+        args.append("".join(buf))
+    return args
+
 def resolve_ytdlp(folder):
     """Return the yt-dlp executable to use, or None."""
     if folder:
@@ -155,6 +180,19 @@ class DownloaderApp:
             side="left"
         )
 
+        # Extra yt-dlp arguments (passed through verbatim on every download)
+        extra_frame = tk.Frame(root)
+        extra_frame.pack(fill="x", padx=8, pady=4)
+        tk.Label(extra_frame, text="Extra args:").pack(side="left")
+        self.extra_args_var = tk.StringVar(value=self.config.get("extra_args", ""))
+        self.extra_args_var.trace_add("write", lambda *_: self._save_now())
+        tk.Entry(extra_frame, textvariable=self.extra_args_var).pack(
+            side="left", fill="x", expand=True, padx=4
+        )
+        tk.Label(extra_frame, text="(added to every download)", fg="gray").pack(
+            side="left", padx=(6, 0)
+        )
+
         # Queue list + buttons
         q_frame = tk.LabelFrame(root, text="Queue")
         q_frame.pack(fill="both", expand=False, padx=8, pady=4)
@@ -209,6 +247,7 @@ class DownloaderApp:
         save_config({
             "ytdlp_folder": self.ytdlp_folder_var.get().strip(),
             "save_folder": self.folder_var.get().strip(),
+            "extra_args": self.extra_args_var.get().strip(),
         })
 
     # ---------- Enable/disable groups ----------
@@ -313,6 +352,7 @@ class DownloaderApp:
             if self.merge_var.get() and not video_only:
                 cmd += ["--merge-output-format", "mp4"]
 
+        cmd += split_extra_args(self.extra_args_var.get())
         cmd += ["--newline", url]
 
         self._log(f"\n$ {' '.join(cmd)}\n\n")
